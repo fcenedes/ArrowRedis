@@ -27,8 +27,9 @@ ArrowRedis is a Python tool for generating large Apache Arrow IPC files, splitti
 - [Performance Tuning](#performance-tuning)
 - [Benchmarking](#benchmarking)
 - [Performance Improvements](#performance-improvements)
-- [Troubleshooting](#troubleshooting)
+- [Redis Cloud & Authentication](#redis-cloud--authentication)
 - [Redis Cluster Considerations](#redis-cluster-considerations)
+- [Troubleshooting](#troubleshooting)
 
 ## Architecture
 
@@ -93,9 +94,16 @@ pip install -e .
 
 ### 1. Start Redis
 
-Using Docker:
+**Option A: Local Redis (Docker)**
 ```bash
 docker run -d -p 6379:6379 --name redis-arrow redis:latest
+```
+
+**Option B: Redis Cloud**
+
+Sign up at [Redis Cloud](https://redis.com/try-free/) and get your connection URL:
+```
+rediss://default:your-password@your-endpoint.cloud.redislabs.com:12345/0
 ```
 
 ### 2. Generate a Dataset
@@ -123,10 +131,21 @@ Generating batches: 100%|████████████| 128/128 [00:05<00
 
 ### 3. Upload to Redis
 
+**Local Redis:**
 ```bash
 python bench_arrow.py split \
   --inp ./dataset.arrow \
   --redis-url redis://localhost:6379/0 \
+  --prefix demo:v1 \
+  --batches 16 \
+  --compression zstd
+```
+
+**Redis Cloud:**
+```bash
+python bench_arrow.py split \
+  --inp ./dataset.arrow \
+  --redis-url "rediss://default:your-password@your-endpoint.cloud.redislabs.com:12345/0" \
   --prefix demo:v1 \
   --batches 16 \
   --compression zstd
@@ -145,9 +164,19 @@ Uploading to Redis: 100%|████████████| 128/128 [00:02<00
 
 ### 4. Read from Redis
 
+**Local Redis:**
 ```bash
 python bench_arrow.py read \
   --redis-url redis://localhost:6379/0 \
+  --prefix demo:v1 \
+  --partitions 0,1,2 \
+  --batches 16
+```
+
+**Redis Cloud:**
+```bash
+python bench_arrow.py read \
+  --redis-url "rediss://default:your-password@your-endpoint.cloud.redislabs.com:12345/0" \
   --prefix demo:v1 \
   --partitions 0,1,2 \
   --batches 16
@@ -298,6 +327,7 @@ Each generated batch contains the following columns:
 
 The project includes an automated benchmarking suite that tests various file sizes:
 
+**Local Redis:**
 ```bash
 # Run all benchmarks (50MB, 250MB, 512MB, 1GB)
 python benchmark_test.py --redis-url redis://localhost:6379/0
@@ -310,6 +340,17 @@ python benchmark_test.py --redis-url redis://localhost:6379/0 --output-json resu
 
 # Keep files for inspection (don't cleanup)
 python benchmark_test.py --redis-url redis://localhost:6379/0 --no-cleanup
+```
+
+**Redis Cloud:**
+```bash
+# Set URL as environment variable
+export REDIS_URL="rediss://default:your-password@your-endpoint.cloud.redislabs.com:12345/0"
+
+# Run benchmarks
+python benchmark_test.py --redis-url "$REDIS_URL"
+python benchmark_test.py --redis-url "$REDIS_URL" --size 512mb
+python benchmark_test.py --redis-url "$REDIS_URL" --output-json results.json
 ```
 
 ### Benchmark Configurations
@@ -416,18 +457,143 @@ This project has been optimized with several performance improvements:
 - Fixed Path handling for cross-platform compatibility
 - Corrected docstring references
 
+## Redis Cloud & Authentication
+
+### Supported URL Formats
+
+ArrowRedis supports all standard Redis URL formats with authentication:
+
+```bash
+# Local Redis (no auth)
+redis://localhost:6379/0
+
+# Redis with password only
+redis://:password@host:port/db
+
+# Redis with username and password (Redis 6+)
+redis://username:password@host:port/db
+
+# Redis Cloud with TLS (recommended)
+rediss://default:your-password@your-endpoint.cloud.redislabs.com:12345/0
+
+# Redis Enterprise
+redis://username:password@enterprise-endpoint:port/db
+```
+
+### Redis Cloud Setup
+
+1. **Sign up** at [Redis Cloud](https://redis.com/try-free/)
+2. **Create a database** and note your connection details
+3. **Get your URL** from the Redis Cloud dashboard (format: `rediss://...`)
+4. **Test your connection:**
+
+```bash
+# Test with the provided script
+python test_redis_auth.py "rediss://default:your-password@your-endpoint.cloud.redislabs.com:12345/0"
+
+# Or test with redis-cli
+redis-cli -u "rediss://default:your-password@your-endpoint.cloud.redislabs.com:12345/0" PING
+```
+
+5. **Use the URL** in all commands:
+
+```bash
+# Set as environment variable (recommended)
+export REDIS_URL="rediss://default:your-password@your-endpoint.cloud.redislabs.com:12345/0"
+
+# Generate dataset
+python bench_arrow.py gen --out ./data.arrow --partitions 8 --batches 16 --rows 100000
+
+# Upload to Redis Cloud
+python bench_arrow.py split --inp ./data.arrow --redis-url "$REDIS_URL" --prefix mydata --batches 16
+
+# Read from Redis Cloud
+python bench_arrow.py read --redis-url "$REDIS_URL" --prefix mydata --partitions 0,1,2 --batches 16
+
+# Run benchmarks
+python benchmark_test.py --redis-url "$REDIS_URL" --size 50mb
+```
+
+### Special Characters in Passwords
+
+If your password contains special characters, URL-encode them:
+
+| Character | Encoded |
+|-----------|---------|
+| `@`       | `%40`   |
+| `:`       | `%3A`   |
+| `/`       | `%2F`   |
+| `?`       | `%3F`   |
+| `#`       | `%23`   |
+| `&`       | `%26`   |
+
+**Example:**
+```bash
+# Password: my:pass@word
+# Encoded URL:
+rediss://default:my%3Apass%40word@host:port/0
+```
+
+### Testing Your Connection
+
+```bash
+# Test with redis-cli
+redis-cli -u "rediss://username:password@host:port/0" PING
+
+# Test with Python
+python -c "
+import asyncio
+from redis.asyncio import Redis
+
+async def test():
+    r = Redis.from_url('rediss://username:password@host:port/0')
+    print('Connected:', await r.ping())
+    await r.close()
+
+asyncio.run(test())
+"
+```
+
+### TLS/SSL Connections
+
+Redis Cloud requires TLS. Use `rediss://` (note the double 's'):
+
+```bash
+# ✅ Correct - with TLS
+rediss://default:password@host:port/0
+
+# ❌ Wrong - without TLS (will fail)
+redis://default:password@host:port/0
+```
+
 ## Redis Cluster Considerations
 
-When using Redis Cluster (`--cluster on`):
-- All keys for a partition share the same hash slot via `{part=XXXXX}` tag
-- MGET operations work within a single partition
-- Cross-partition reads use multiple MGET calls
-- Ensure your cluster has sufficient slots and memory
+### Cluster Mode vs Standalone
 
-When using Redis Enterprise or standalone (`--cluster off`):
+**Standalone Mode** (default, `--cluster off`):
 - Single connection endpoint
 - MGET can span any keys
 - Simpler configuration
+- **Use for:** Redis Cloud (non-cluster), Redis Enterprise, local Redis
+
+**Cluster Mode** (`--cluster on`):
+- Multiple nodes with sharding
+- All keys for a partition share the same hash slot via `{part=XXXXX}` tag
+- MGET operations work within a single partition
+- Cross-partition reads use multiple MGET calls
+- **Use for:** Redis Cluster deployments
+
+### When to Use Cluster Mode
+
+```bash
+# Redis Cloud (standalone) - DEFAULT
+python bench_arrow.py split --redis-url "rediss://..." --prefix data --batches 16
+
+# Redis Cluster - use --cluster on
+python bench_arrow.py split --redis-url "redis://cluster-node:6379" --prefix data --batches 16 --cluster on
+```
+
+Most Redis Cloud deployments use **standalone mode** (not cluster mode), so you typically don't need `--cluster on`.
 
 ## Troubleshooting
 
@@ -437,9 +603,31 @@ When using Redis Enterprise or standalone (`--cluster off`):
 
 **Solution:**
 - Ensure Redis is running: `redis-cli ping` should return `PONG`
-- Check Redis URL format: `redis://host:port/db` or `redis://host:port` for cluster
+- Check Redis URL format: `redis://host:port/db` or `rediss://host:port/db` for TLS
 - Verify network connectivity and firewall rules
 - Check logs for retry attempts and specific error messages
+- For Redis Cloud: Ensure you're using `rediss://` (with TLS)
+
+### Authentication Errors
+
+**Problem:** `AuthenticationError`, `NOAUTH`, or `WRONGPASS`
+
+**Solution:**
+- Verify username and password are correct
+- Check URL format: `redis://username:password@host:port/db`
+- URL-encode special characters in password (see [Special Characters](#special-characters-in-passwords))
+- For Redis Cloud: Use the exact URL from your dashboard
+- Test connection: `redis-cli -u "your-url" PING`
+
+### TLS/SSL Errors
+
+**Problem:** `SSL: CERTIFICATE_VERIFY_FAILED` or connection timeout with Redis Cloud
+
+**Solution:**
+- Use `rediss://` (double 's') for TLS connections
+- Ensure your Python has SSL support: `python -c "import ssl; print(ssl.OPENSSL_VERSION)"`
+- For self-signed certificates, you may need to configure SSL context (advanced)
+- Redis Cloud always requires TLS - use `rediss://`
 
 ### Memory Issues
 
