@@ -9,5 +9,6 @@ dependencies = [
     "numpy>=2.3.4",
     "pyarrow>=22.0.0",
     "redis>=7.0.1",
+    "tqdm>=4.66.0",
     "uvloop>=0.22.1",
 ]

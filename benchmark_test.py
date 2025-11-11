@@ -182,8 +182,7 @@ async def run_benchmark(
     
     # 1. Generate Arrow file
     print(f"\n📝 Generating Arrow file...")
-    gen_start = time.perf_counter()
-    generate_one_ipc_file(
+    gen_metrics = generate_one_ipc_file(
         out=arrow_file,
         partitions=config.partitions,
         batches=config.batches,
@@ -193,21 +192,18 @@ async def run_benchmark(
         string_card=config.string_cardinality,
         seed=42,
     )
-    gen_time = time.perf_counter() - gen_start
-    
-    file_size_bytes = arrow_file.stat().st_size
-    file_size_mb = file_size_bytes / (1024 ** 2)
-    total_rows = config.partitions * config.batches * config.rows
-    gen_throughput_mb = file_size_mb / gen_time
-    gen_throughput_rows = total_rows / gen_time
-    
+
+    gen_time = gen_metrics['total_time']
+    file_size_mb = gen_metrics['file_size_mb']
+    gen_throughput_mb = gen_metrics['throughput_mb_per_sec']
+    gen_throughput_rows = gen_metrics['throughput_rows_per_sec']
+
     print(f"   ✅ Generated {file_size_mb:.2f} MB in {gen_time:.2f}s")
     print(f"   ⚡ Throughput: {gen_throughput_mb:.2f} MB/s, {gen_throughput_rows:,.0f} rows/s")
     
     # 2. Split to Redis
     print(f"\n📤 Splitting to Redis...")
-    split_start = time.perf_counter()
-    chunks = await split_ipc_to_redis(
+    split_metrics = await split_ipc_to_redis(
         ipc_path=arrow_file,
         redis_url=redis_url,
         prefix=prefix,
@@ -216,9 +212,11 @@ async def run_benchmark(
         cluster=cluster,
         max_inflight=max_inflight,
     )
-    split_time = time.perf_counter() - split_start
-    split_throughput_mb = file_size_mb / split_time
-    
+
+    split_time = split_metrics['total_time']
+    chunks = split_metrics['chunks']
+    split_throughput_mb = split_metrics['throughput_mb_per_sec']
+
     print(f"   ✅ Uploaded {chunks} chunks in {split_time:.2f}s")
     print(f"   ⚡ Throughput: {split_throughput_mb:.2f} MB/s")
     

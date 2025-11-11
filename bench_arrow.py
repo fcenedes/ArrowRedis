@@ -21,13 +21,18 @@ python bench_arrow.py \
 """
 
 from __future__ import annotations
-import argparse, asyncio, io, sys, time
+import argparse, asyncio, io, logging, sys, time
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, TypeVar, Callable
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.ipc as ipc
+from tqdm import tqdm
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # ---- uvloop (optional) ----
 try:
@@ -46,6 +51,34 @@ except Exception:
 
 
 # ----------------------------
+# Retry utility
+# ----------------------------
+T = TypeVar('T')
+
+async def retry_with_backoff(
+    func: Callable[..., T],
+    *args,
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 60.0,
+    **kwargs
+) -> T:
+    """Retry async function with exponential backoff."""
+    for attempt in range(max_retries):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+
+            delay = min(base_delay * (2 ** attempt), max_delay)
+            logger.warning(f"Attempt {attempt + 1}/{max_retries} failed: {e}. Retrying in {delay:.1f}s...")
+            await asyncio.sleep(delay)
+
+    raise RuntimeError("Should not reach here")
+
+
+# ----------------------------
 # Data generation: ONE big IPC
 # ----------------------------
 def _rand_vocab(card: int, rng: np.random.Generator) -> list[str]:
@@ -57,7 +90,7 @@ def _rand_vocab(card: int, rng: np.random.Generator) -> list[str]:
     return out
 
 def _make_batch(rows: int, partition_id: int, global_batch_id: int,
-                dict_strings: bool, string_card: int, rng: np.random.Generator) -> pa.RecordBatch:
+                dict_strings: bool, vocab: list[str], rng: np.random.Generator) -> pa.RecordBatch:
     id64 = pa.array(np.arange(global_batch_id*rows, global_batch_id*rows + rows, dtype=np.int64))
     part = pa.array(np.full(rows, partition_id, dtype=np.int32))
     i32  = pa.array(rng.integers(-1_000_000, 1_000_000, size=rows, dtype=np.int32))
@@ -68,9 +101,13 @@ def _make_batch(rows: int, partition_id: int, global_batch_id: int,
     base_ns = np.int64(1_700_000_000_000_000_000)
     span_ns = np.int64(30 * 24 * 3600 * 1_000_000_000)
     ts   = pa.array(base_ns + rng.integers(0, span_ns, size=rows, dtype=np.int64), type=pa.timestamp("ns"))
-    dec  = pa.array(rng.integers(-10**10, 10**10, size=rows, dtype=np.int64), type=pa.decimal128(18, 4))
 
-    vocab = _rand_vocab(string_card, rng)
+    # Create decimal values properly
+    from decimal import Decimal
+    dec_vals = [Decimal(str(x / 10000.0)) for x in rng.integers(-10**10, 10**10, size=rows, dtype=np.int64)]
+    dec  = pa.array(dec_vals, type=pa.decimal128(18, 4))
+
+    string_card = len(vocab)
     idx = rng.integers(0, string_card, size=rows, dtype=np.int32)
     if dict_strings:
         s = pa.DictionaryArray.from_arrays(pa.array(idx, pa.int32()), pa.array(vocab, pa.string()))
@@ -94,40 +131,100 @@ def _make_batch(rows: int, partition_id: int, global_batch_id: int,
     return pa.record_batch([c for _, c in cols], names=[n for n, _ in cols])
 
 def generate_one_ipc_file(out: Path, partitions: int, batches: int, rows: int,
-                          compression: str, dict_strings: bool, string_card: int, seed: int) -> None:
+                          compression: str, dict_strings: bool, string_card: int, seed: int) -> Dict[str, float]:
+    t_start = time.perf_counter()
+
     rng = np.random.default_rng(seed)
+
+    # Generate vocabulary ONCE and reuse across all batches
+    t_vocab = time.perf_counter()
+    vocab = _rand_vocab(string_card, rng)
+    t_vocab = time.perf_counter() - t_vocab
+
+    total_batches = partitions * batches
     first = _make_batch(rows, partition_id=0, global_batch_id=0,
-                        dict_strings=dict_strings, string_card=string_card, rng=rng)
+                        dict_strings=dict_strings, vocab=vocab, rng=rng)
     opts = ipc.IpcWriteOptions(compression=None if compression == "uncompressed" else compression)
-    with pa.OSFile(out, "wb") as sink, ipc.RecordBatchFileWriter(sink, first.schema, options=opts) as w:
+
+    with pa.OSFile(str(out), "wb") as sink, \
+         ipc.RecordBatchFileWriter(sink, first.schema, options=opts) as w, \
+         tqdm(total=total_batches, desc="Generating batches", unit="batch", disable=None) as pbar:
+
         w.write_batch(first)
-        gb = 1
+        pbar.update(1)
+
         for p in range(partitions):
             start_b = 0 if p != 0 else 1
             for b in range(start_b, batches):
                 rb = _make_batch(rows, partition_id=p, global_batch_id=(p*batches+b),
-                                 dict_strings=dict_strings, string_card=string_card, rng=rng)
+                                 dict_strings=dict_strings, vocab=vocab, rng=rng)
                 w.write_batch(rb)
-                gb += 1
+                pbar.update(1)
+
+    t_total = time.perf_counter() - t_start
+    file_size = out.stat().st_size
+    file_size_mb = file_size / (1024**2)
+    total_rows = partitions * batches * rows
+
+    metrics = {
+        'total_time': t_total,
+        'vocab_time': t_vocab,
+        'file_size_bytes': file_size,
+        'file_size_mb': file_size_mb,
+        'total_rows': total_rows,
+        'throughput_rows_per_sec': total_rows / t_total,
+        'throughput_mb_per_sec': file_size_mb / t_total,
+    }
+
+    logger.info(f"Generated {file_size_mb:.2f} MB in {t_total:.2f}s")
+    logger.info(f"Throughput: {metrics['throughput_mb_per_sec']:.2f} MB/s, {metrics['throughput_rows_per_sec']:,.0f} rows/s")
+
+    return metrics
 
 
 # ---------------------------------
 # Redis connection helpers (async)
 # ---------------------------------
-async def open_redis(url: str, cluster: bool) -> Redis:
+async def open_redis(url: str, cluster: bool,
+                     max_connections: int = 50,
+                     socket_keepalive: bool = True,
+                     socket_connect_timeout: float = 5.0,
+                     retry_on_timeout: bool = True) -> Redis:
     """
+    Open Redis connection with optimized pool settings.
+
     cluster=False  -> Redis (works with Redis Enterprise proxy like standalone)
     cluster=True   -> RedisCluster (keys must share hash slot for pipelines/MGET)
     """
-    if cluster:
-        if RedisCluster is None:
-            raise RuntimeError("redis.asyncio.cluster.RedisCluster not available. Upgrade redis-py.")
-        r = RedisCluster.from_url(url, decode_responses=False, readonly=True)
-    else:
-        r = Redis.from_url(url, decode_responses=False)
-    # quick ping
-    await r.ping()
-    return r
+    try:
+        if cluster:
+            if RedisCluster is None:
+                raise RuntimeError("redis.asyncio.cluster.RedisCluster not available. Upgrade redis-py.")
+            r = RedisCluster.from_url(
+                url,
+                decode_responses=False,
+                readonly=True,
+                max_connections=max_connections,
+                socket_keepalive=socket_keepalive,
+                socket_connect_timeout=socket_connect_timeout,
+                retry_on_timeout=retry_on_timeout,
+            )
+        else:
+            r = Redis.from_url(
+                url,
+                decode_responses=False,
+                max_connections=max_connections,
+                socket_keepalive=socket_keepalive,
+                socket_connect_timeout=socket_connect_timeout,
+                retry_on_timeout=retry_on_timeout,
+            )
+        # quick ping
+        await r.ping()
+        logger.info(f"Connected to Redis at {url}")
+        return r
+    except Exception as e:
+        logger.error(f"Failed to connect to Redis at {url}: {e}")
+        raise
 
 
 # ---------------------------------
@@ -135,9 +232,26 @@ async def open_redis(url: str, cluster: bool) -> Redis:
 # ---------------------------------
 async def split_ipc_to_redis(ipc_path: Path, redis_url: str, prefix: str,
                              batches_per_partition: int, compression: str,
-                             cluster: bool, max_inflight: int = 256) -> int:
-    r = await open_redis(redis_url, cluster)
-    reader = ipc.open_file(str(ipc_path))
+                             cluster: bool, max_inflight: int = 256,
+                             batch_gather_size: int = 100) -> Dict[str, float]:
+    t_start = time.perf_counter()
+
+    try:
+        r = await open_redis(redis_url, cluster)
+    except Exception as e:
+        logger.error(f"Failed to connect to Redis: {e}")
+        raise
+
+    try:
+        reader = ipc.open_file(str(ipc_path))
+    except Exception as e:
+        logger.error(f"Failed to open Arrow file {ipc_path}: {e}")
+        await r.close()
+        raise
+
+    file_size = ipc_path.stat().st_size
+    file_size_mb = file_size / (1024**2)
+
     opts = ipc.IpcWriteOptions(compression=None if compression == "uncompressed" else compression)
 
     # Track per-partition batch index as we stream the file
@@ -148,34 +262,57 @@ async def split_ipc_to_redis(ipc_path: Path, redis_url: str, prefix: str,
 
     async def put_one(k: str, payload: bytes):
         async with sem:
-            await r.set(k, payload)
+            await retry_with_backoff(r.set, k, payload, max_retries=3)
 
     total = 0
-    for i in range(reader.num_record_batches):
-        rb = reader.get_batch(i)
-        p_idx = rb.schema.get_field_index("partition")
-        if p_idx == -1:
-            # fallback if no column; map by linear order
-            part = i // batches_per_partition
-        else:
-            part = int(rb.column(p_idx)[0].as_py())
+    try:
+        with tqdm(total=reader.num_record_batches, desc="Uploading to Redis", unit="batch", disable=None) as pbar:
+            for i in range(reader.num_record_batches):
+                rb = reader.get_batch(i)
+                p_idx = rb.schema.get_field_index("partition")
+                if p_idx == -1:
+                    # fallback if no column; map by linear order
+                    part = i // batches_per_partition
+                else:
+                    part = int(rb.column(p_idx)[0].as_py())
 
-        b_in_part = next_batch_idx.get(part, 0)
-        next_batch_idx[part] = b_in_part + 1
+                b_in_part = next_batch_idx.get(part, 0)
+                next_batch_idx[part] = b_in_part + 1
 
-        key = f"{prefix}:{{part={part:05d}}}:batch={b_in_part:05d}"
+                key = f"{prefix}:{{part={part:05d}}}:batch={b_in_part:05d}"
 
-        sink = pa.BufferOutputStream()
-        with ipc.new_stream(sink, rb.schema, options=opts) as w:
-            w.write_batch(rb)
-        buf = sink.getvalue().to_pybytes()
-        put_tasks.append(asyncio.create_task(put_one(key, buf)))
-        total += 1
+                sink = pa.BufferOutputStream()
+                with ipc.new_stream(sink, rb.schema, options=opts) as w:
+                    w.write_batch(rb)
+                buf = sink.getvalue().to_pybytes()
+                put_tasks.append(asyncio.create_task(put_one(key, buf)))
+                total += 1
+                pbar.update(1)
 
-    if put_tasks:
-        await asyncio.gather(*put_tasks)
-    await r.close()
-    return total
+                # Gather in batches to avoid memory buildup
+                if len(put_tasks) >= batch_gather_size:
+                    await asyncio.gather(*put_tasks)
+                    put_tasks.clear()
+
+            # Final gather for remaining tasks
+            if put_tasks:
+                await asyncio.gather(*put_tasks)
+    finally:
+        await r.close()
+
+    t_total = time.perf_counter() - t_start
+
+    metrics = {
+        'total_time': t_total,
+        'chunks': total,
+        'file_size_mb': file_size_mb,
+        'throughput_mb_per_sec': file_size_mb / t_total,
+    }
+
+    logger.info(f"Uploaded {total} chunks ({file_size_mb:.2f} MB) in {t_total:.2f}s")
+    logger.info(f"Throughput: {metrics['throughput_mb_per_sec']:.2f} MB/s")
+
+    return metrics
 
 
 # ---------------------------------
@@ -187,49 +324,54 @@ async def mget_partition(r: Redis, keys: List[str]) -> List[Optional[bytes]]:
     For very large sets, consider chunking (we do in caller).
     """
     # Use a plain MGET; for cluster this works because keys share slot tag.
-    return await r.mget(keys)
+    return await retry_with_backoff(r.mget, keys, max_retries=3)
 
 async def read_from_redis(redis_url: str, prefix: str, partitions: List[int], batches_per_part: int,
                           pipeline: int, concurrency: int, cluster: bool) -> pa.Table:
-    r = await open_redis(redis_url, cluster)
+    try:
+        r = await open_redis(redis_url, cluster)
+    except Exception as e:
+        logger.error(f"Failed to connect to Redis: {e}")
+        raise
 
-    # Build keys per partition (hash-tagged)
-    all_chunks: List[List[str]] = []
-    for p in partitions:
-        part_keys = [f"{prefix}:{{part={p:05d}}}:batch={b:05d}" for b in range(batches_per_part)]
-        # chunk by pipeline size (MGET batch)
-        all_chunks.extend([part_keys[i:i+pipeline] for i in range(0, len(part_keys), pipeline)])
+    try:
+        # Build keys per partition (hash-tagged)
+        all_chunks: List[List[str]] = []
+        for p in partitions:
+            part_keys = [f"{prefix}:{{part={p:05d}}}:batch={b:05d}" for b in range(batches_per_part)]
+            # chunk by pipeline size (MGET batch)
+            all_chunks.extend([part_keys[i:i+pipeline] for i in range(0, len(part_keys), pipeline)])
 
-    sem = asyncio.Semaphore(concurrency)
-    results: List[Optional[bytes]] = []
+        sem = asyncio.Semaphore(concurrency)
+        results: List[Optional[bytes]] = []
 
-    async def fetch_chunk(chunk: List[str]):
-        async with sem:
-            vals = await mget_partition(r, chunk)
-            return vals
+        async def fetch_chunk(chunk: List[str]):
+            async with sem:
+                vals = await mget_partition(r, chunk)
+                return vals
 
-    t0 = time.perf_counter()
-    vals_lists = await asyncio.gather(*[fetch_chunk(ch) for ch in all_chunks])
-    t_fetch = time.perf_counter() - t0
-    # flatten
-    for vl in vals_lists:
-        results.extend(vl)
+        t0 = time.perf_counter()
+        vals_lists = await asyncio.gather(*[fetch_chunk(ch) for ch in all_chunks])
+        t_fetch = time.perf_counter() - t0
+        # flatten
+        for vl in vals_lists:
+            results.extend(vl)
 
-    # Parse IPC streams concurrently (to thread pool; Arrow parsing is C++ & fast)
-    def parse_one(buf: bytes) -> pa.Table:
-        br = pa.BufferReader(buf)
-        return ipc.open_stream(br).read_all()
+        # Parse IPC streams concurrently (to thread pool; Arrow parsing is C++ & fast)
+        def parse_one(buf: bytes) -> pa.Table:
+            br = pa.BufferReader(buf)
+            return ipc.open_stream(br).read_all()
 
-    parse_inputs = [buf for buf in results if buf]
-    t1 = time.perf_counter()
-    tables = await asyncio.gather(*[asyncio.to_thread(parse_one, b) for b in parse_inputs])
-    t_parse = time.perf_counter() - t1
+        parse_inputs = [buf for buf in results if buf]
+        t1 = time.perf_counter()
+        tables = await asyncio.gather(*[asyncio.to_thread(parse_one, b) for b in parse_inputs])
+        t_parse = time.perf_counter() - t1
 
-    await r.close()
-
-    table = pa.concat_tables(tables, promote=True) if tables else pa.table({})
-    print(f"Fetched {len(parse_inputs)}/{len(results)} present chunks in {t_fetch:.2f}s; parsed in {t_parse:.2f}s; rows={table.num_rows:,}")
-    return table
+        table = pa.concat_tables(tables, promote=True) if tables else pa.table({})
+        logger.info(f"Fetched {len(parse_inputs)}/{len(results)} present chunks in {t_fetch:.2f}s; parsed in {t_parse:.2f}s; rows={table.num_rows:,}")
+        return table
+    finally:
+        await r.close()
 
 
 # ----------------------------
@@ -272,7 +414,7 @@ def build_cli():
 async def main_async():
     args = build_cli().parse_args()
     if args.cmd == "gen":
-        generate_one_ipc_file(
+        metrics = generate_one_ipc_file(
             out=args.out,
             partitions=args.partitions,
             batches=args.batches,
@@ -282,9 +424,13 @@ async def main_async():
             string_card=args.string_cardinality,
             seed=args.seed,
         )
-        print(f"Wrote {args.out} ({args.partitions} partitions × {args.batches} batches × {args.rows} rows)")
+        print(f"\n✅ Wrote {args.out}")
+        print(f"   Partitions: {args.partitions} × Batches: {args.batches} × Rows: {args.rows:,}")
+        print(f"   File size: {metrics['file_size_mb']:.2f} MB")
+        print(f"   Time: {metrics['total_time']:.2f}s")
+        print(f"   Throughput: {metrics['throughput_mb_per_sec']:.2f} MB/s, {metrics['throughput_rows_per_sec']:,.0f} rows/s")
     elif args.cmd == "split":
-        n = await split_ipc_to_redis(
+        metrics = await split_ipc_to_redis(
             ipc_path=args.inp,
             redis_url=args.redis_url,
             prefix=args.prefix,
@@ -293,7 +439,11 @@ async def main_async():
             cluster=(args.cluster == "on"),
             max_inflight=args.max_inflight,
         )
-        print(f"Stored {n} chunks to Redis under '{args.prefix}:' (keys use hash tag {{part=XXXXX}}).")
+        print(f"\n✅ Stored {metrics['chunks']} chunks to Redis under '{args.prefix}:'")
+        print(f"   Keys use hash tag {{part=XXXXX}}")
+        print(f"   File size: {metrics['file_size_mb']:.2f} MB")
+        print(f"   Time: {metrics['total_time']:.2f}s")
+        print(f"   Throughput: {metrics['throughput_mb_per_sec']:.2f} MB/s")
     elif args.cmd == "read":
         parts = [int(x) for x in args.partitions.split(",") if x.strip() != ""]
         _ = await read_from_redis(
