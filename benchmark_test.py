@@ -9,19 +9,26 @@ Generates and tests Arrow files of various sizes:
 - 1 GB
 
 Tests the full pipeline: generate -> split -> read
+Optionally verifies round-trip integrity
 
 Usage:
     # Run all benchmarks
     python benchmark_test.py --redis-url redis://localhost:6379/0
-    
+
     # Run specific size
     python benchmark_test.py --redis-url redis://localhost:6379/0 --size 250mb
-    
+
+    # Run with round-trip verification
+    python benchmark_test.py --redis-url redis://localhost:6379/0 --verify
+
     # Skip cleanup (keep files and Redis keys)
     python benchmark_test.py --redis-url redis://localhost:6379/0 --no-cleanup
-    
+
     # Custom output directory
     python benchmark_test.py --redis-url redis://localhost:6379/0 --output-dir ./benchmarks
+
+    # With S3 comparison
+    python benchmark_test.py --redis-url redis://localhost:6379/0 --s3-bucket my-bucket
 """
 
 from __future__ import annotations
@@ -90,6 +97,9 @@ class BenchmarkResult:
     read_rows: int
     read_throughput_mb_sec: float
 
+    # Overall
+    total_time_sec: float
+
     # Local filesystem metrics (optional)
     local_read_time_sec: float = 0.0
     local_read_throughput_mb_sec: float = 0.0
@@ -102,8 +112,10 @@ class BenchmarkResult:
     s3_read_throughput_mb_sec: float = 0.0
     s3_read_rows: int = 0
 
-    # Overall
-    total_time_sec: float
+    # Verification metrics (optional)
+    verification_enabled: bool = False
+    verification_passed: bool = False
+    verification_time_sec: float = 0.0
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -181,6 +193,15 @@ class BenchmarkResult:
             else:
                 print(f"  ⚠️  S3 is {1/speedup:.2f}x faster than Redis")
 
+        # Verification results
+        if self.verification_enabled:
+            print(f"\n🔍 Round-Trip Verification:")
+            print(f"  Time: {self.verification_time_sec:.2f}s")
+            if self.verification_passed:
+                print(f"  ✅ FILES ARE IDENTICAL - Data integrity verified!")
+            else:
+                print(f"  ❌ VERIFICATION FAILED - Data mismatch detected!")
+
         print(f"\nTotal Time: {self.total_time_sec:.2f}s")
         print(f"{'='*80}\n")
 
@@ -231,9 +252,11 @@ async def run_benchmark(
     aws_access_key: str = None,
     aws_secret_key: str = None,
     aws_region: str = "us-east-1",
+    verify: bool = False,
 ) -> BenchmarkResult:
     """
     Run a complete benchmark: generate -> split -> read (Redis + optionally S3).
+    Optionally verify round-trip integrity.
     """
     print(f"\n🚀 Starting benchmark: {config.name}")
     print(f"   Target size: ~{config.target_size_mb} MB")
@@ -416,6 +439,70 @@ async def run_benchmark(
         else:
             print(f"   ⚠️  S3 is {1/speedup:.2f}x faster")
 
+    # 6. Round-trip verification (optional)
+    verification_passed = False
+    verification_time = 0.0
+
+    if verify:
+        import pyarrow as pa
+        import pyarrow.ipc as ipc
+
+        print(f"\n🔍 Verifying round-trip integrity...")
+        verify_start = time.perf_counter()
+
+        # Read all partitions from Redis and reconstitute
+        reconstituted_file = output_dir / f"benchmark_{config.name.lower()}_reconstituted.arrow"
+
+        print(f"   Reading all partitions from Redis...")
+        redis_table = await read_from_redis(
+            redis_url=redis_url,
+            prefix=prefix,
+            partitions=None,  # Read all partitions
+            batches_per_part=config.batches,
+            pipeline=pipeline,
+            concurrency=concurrency,
+            cluster=cluster,
+        )
+
+        print(f"   Saving reconstituted file...")
+        # Use same compression as original file
+        compression_map = {
+            "zstd": "zstd",
+            "lz4": "lz4",
+            "uncompressed": None,
+        }
+        compression = compression_map.get(config.compression, "zstd")
+        ipc_options = ipc.IpcWriteOptions(compression=compression)
+        writer = ipc.new_file(str(reconstituted_file), redis_table.schema, options=ipc_options)
+        writer.write_table(redis_table)
+        writer.close()
+
+        print(f"   Comparing files...")
+        # Read original file
+        original_reader = ipc.open_file(str(arrow_file))
+        original_table = original_reader.read_all()
+
+        # Compare
+        if original_table.equals(redis_table):
+            verification_passed = True
+            print(f"   ✅ FILES ARE IDENTICAL!")
+            print(f"      Original: {original_table.num_rows:,} rows")
+            print(f"      Reconstituted: {redis_table.num_rows:,} rows")
+        else:
+            verification_passed = False
+            print(f"   ❌ VERIFICATION FAILED!")
+            print(f"      Original: {original_table.num_rows:,} rows")
+            print(f"      Reconstituted: {redis_table.num_rows:,} rows")
+            if original_table.num_rows != redis_table.num_rows:
+                print(f"      Row count mismatch!")
+            elif original_table.schema != redis_table.schema:
+                print(f"      Schema mismatch!")
+            else:
+                print(f"      Data values differ!")
+
+        verification_time = time.perf_counter() - verify_start
+        print(f"   Verification time: {verification_time:.2f}s")
+
     total_time = time.perf_counter() - total_start
 
     # Create result
@@ -441,6 +528,9 @@ async def run_benchmark(
         s3_read_time_sec=s3_read_time,
         s3_read_throughput_mb_sec=s3_read_throughput,
         s3_read_rows=s3_read_rows,
+        verification_enabled=verify,
+        verification_passed=verification_passed,
+        verification_time_sec=verification_time,
         total_time_sec=total_time,
     )
 
@@ -498,6 +588,10 @@ async def main_async():
     parser.add_argument("--aws-region", type=str, default="us-east-1",
                        help="AWS region (default: us-east-1)")
 
+    # Verification options
+    parser.add_argument("--verify", action="store_true",
+                       help="Verify round-trip integrity by reconstituting and comparing files")
+
     args = parser.parse_args()
     
     # Determine which benchmarks to run
@@ -533,6 +627,7 @@ async def main_async():
                 aws_access_key=args.aws_access_key,
                 aws_secret_key=args.aws_secret_key,
                 aws_region=args.aws_region,
+                verify=args.verify,
             )
             results.append(result)
             result.print_summary()
@@ -558,6 +653,13 @@ async def main_async():
             if arrow_file.exists():
                 arrow_file.unlink()
                 print(f"   ✅ Deleted {arrow_file}")
+
+            # Also clean up reconstituted file if verification was enabled
+            if args.verify:
+                reconstituted_file = args.output_dir / f"benchmark_{config.name.lower()}_reconstituted.arrow"
+                if reconstituted_file.exists():
+                    reconstituted_file.unlink()
+                    print(f"   ✅ Deleted {reconstituted_file}")
     
     # Save results to JSON if requested
     if args.output_json and results:

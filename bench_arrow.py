@@ -710,6 +710,8 @@ def build_cli():
     r.add_argument("--concurrency", type=int, default=256, help="Concurrent MGET batches")
     r.add_argument("--cluster", choices=["on", "off"], default="off")
     r.add_argument("--out", type=Path, help="Optional: Save reconstituted Arrow file to this path")
+    r.add_argument("--compression", choices=["zstd", "lz4", "uncompressed"], default="zstd",
+                   help="Compression for output file (default: zstd)")
 
     # S3 commands
     s3_upload = sub.add_parser("s3-upload", help="Upload Arrow IPC file to S3")
@@ -796,11 +798,21 @@ async def main_async():
 
         # Optionally save reconstituted Arrow file
         if args.out:
-            writer = ipc.new_file(str(args.out), table.schema)
+            # Set up compression
+            compression_map = {
+                "zstd": "zstd",
+                "lz4": "lz4",
+                "uncompressed": None,
+            }
+            compression = compression_map.get(args.compression, "zstd")
+
+            # Create IPC writer with compression options
+            ipc_options = ipc.IpcWriteOptions(compression=compression)
+            writer = ipc.new_file(str(args.out), table.schema, options=ipc_options)
             writer.write_table(table)
             writer.close()
             file_size_mb = args.out.stat().st_size / (1024 * 1024)
-            print(f"   💾 Saved to {args.out} ({file_size_mb:.2f} MB)")
+            print(f"   💾 Saved to {args.out} ({file_size_mb:.2f} MB, compression={args.compression})")
     elif args.cmd == "s3-upload":
         metrics = upload_to_s3(
             ipc_path=args.inp,

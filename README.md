@@ -203,6 +203,44 @@ python bench_arrow.py read \
 Fetched 48/48 present chunks in 0.23s; parsed in 0.15s; rows=4,800,000
 ```
 
+### 5. Round-Trip Verification (Optional)
+
+Prove that data survives Redis round-trip without corruption:
+
+```bash
+# Read ALL partitions and reconstitute the original file
+python bench_arrow.py read \
+  --redis-url redis://localhost:6379/0 \
+  --prefix demo:v1 \
+  --partitions all \
+  --batches 16 \
+  --out ./reconstituted.arrow \
+  --compression zstd
+
+# Verify files are identical
+python bench_arrow.py verify \
+  --file1 ./dataset.arrow \
+  --file2 ./reconstituted.arrow
+```
+
+**Output:**
+```
+Discovering partitions from Redis with prefix 'demo:v1'...
+Found 8 partitions: [0, 1, 2, 3, 4, 5, 6, 7]
+Fetched 128/128 present chunks in 0.45s; parsed in 0.32s; rows=12,800,000
+
+✅ Read 12,800,000 rows from Redis
+   💾 Saved to ./reconstituted.arrow (245.67 MB, compression=zstd)
+
+🔍 Verifying Arrow files...
+   File 1: ./dataset.arrow (245.67 MB, 12,800,000 rows)
+   File 2: ./reconstituted.arrow (245.67 MB, 12,800,000 rows)
+
+✅ FILES ARE IDENTICAL!
+   Schema: 10 columns
+   Rows: 12,800,000
+```
+
 ## Usage
 
 ### 1. Generate Arrow IPC File
@@ -310,7 +348,8 @@ python bench_arrow.py read \
   --prefix demo:v1 \
   --partitions all \
   --batches 16 \
-  --out ./reconstituted.arrow
+  --out ./reconstituted.arrow \
+  --compression zstd
 ```
 
 **Parameters:**
@@ -322,13 +361,14 @@ python bench_arrow.py read \
 - `--concurrency`: Maximum concurrent MGET operations (default: 256)
 - `--cluster`: `on` for RedisCluster, `off` for standalone/proxy (default: off)
 - `--out`: Optional output file to save reconstituted Arrow file
+- `--compression`: Compression for output file: `zstd`, `lz4`, or `uncompressed` (default: zstd)
 
 **Example output:**
 ```
 Fetched 48/48 present chunks in 0.23s; parsed in 0.15s; rows=4,800,000
 
 ✅ Read 4,800,000 rows from Redis
-   💾 Saved to ./reconstituted.arrow (245.67 MB)
+   💾 Saved to ./reconstituted.arrow (245.67 MB, compression=zstd)
 ```
 
 ### 4. S3 Upload (Optional)
@@ -515,6 +555,17 @@ python benchmark_test.py --redis-url "$REDIS_URL" --output-json results.json
 | 512MB | 16         | 16      | 50,000     | 12,800,000 | ~512 MB   |
 | 1GB   | 32         | 16      | 50,000     | 25,600,000 | ~1 GB     |
 
+### Benchmark with Round-Trip Verification
+
+Verify data integrity by reconstituting and comparing files:
+
+```bash
+python benchmark_test.py \
+  --redis-url redis://localhost:6379/0 \
+  --size 250mb \
+  --verify
+```
+
 ### Example Benchmark Output
 
 ```
@@ -524,6 +575,7 @@ ArrowRedis Benchmark Suite
 Redis URL: redis://localhost:6379/0
 Output directory: ./benchmark_data
 Benchmarks: 50MB, 250MB, 512MB, 1GB
+Verification: Enabled
 ================================================================================
 
 🚀 Starting benchmark: 50MB
@@ -544,17 +596,30 @@ Uploading to Redis: 100%|████████████| 32/32 [00:01<00:0
    ✅ Read 160,000 rows in 0.45s
    ⚡ Throughput: 107.18 MB/s
 
-Total Time: 3.67s
+🔍 Verifying round-trip integrity...
+   Reading all partitions from Redis...
+   Saving reconstituted file...
+   Comparing files...
+   ✅ FILES ARE IDENTICAL!
+      Original: 1,600,000 rows
+      Reconstituted: 1,600,000 rows
+   Verification time: 1.23s
+
+🔍 Round-Trip Verification:
+  Time: 1.23s
+  ✅ FILES ARE IDENTICAL - Data integrity verified!
+
+Total Time: 4.90s
 ================================================================================
 
 Summary
 ================================================================================
-Benchmark    Size (MB)    Gen (s)    Split (s)  Read (s)   Total (s)
+Benchmark    Size (MB)    Gen (s)    Split (s)  Read (s)   Verify (s)  Total (s)
 --------------------------------------------------------------------------------
-50MB         48.23        2.10       1.12       0.45       3.67
-250MB        245.67       10.45      5.23       2.15       17.83
-512MB        512.34       21.23      10.67      4.32       36.22
-1GB          1024.56      42.56      21.34      8.67       72.57
+50MB         48.23        2.10       1.12       0.45       1.23        4.90
+250MB        245.67       10.45      5.23       2.15       3.45        21.28
+512MB        512.34       21.23      10.67      4.32       6.78        42.00
+1GB          1024.56      42.56      21.34      8.67       13.45       86.02
 ================================================================================
 ```
 
