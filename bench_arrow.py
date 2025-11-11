@@ -400,6 +400,30 @@ async def split_ipc_to_redis(ipc_path: Path, redis_url: str, prefix: str,
 # ---------------------------------
 # Async parallel read from Redis
 # ---------------------------------
+async def discover_partitions(r: Redis, prefix: str) -> List[int]:
+    """
+    Discover all partition IDs from Redis by scanning keys with the given prefix.
+    Returns sorted list of unique partition IDs.
+    """
+    import re
+    partitions = set()
+    pattern = f"{prefix}:{{part=*}}:batch=*"
+
+    cursor = 0
+    while True:
+        cursor, keys = await r.scan(cursor, match=pattern, count=1000)
+        for key in keys:
+            # Extract partition ID from key like "prefix:{part=00000}:batch=00001"
+            if isinstance(key, bytes):
+                key = key.decode('utf-8')
+            match = re.search(r'\{part=(\d+)\}', key)
+            if match:
+                partitions.add(int(match.group(1)))
+        if cursor == 0:
+            break
+
+    return sorted(partitions)
+
 async def mget_partition(r: Redis, keys: List[str]) -> List[Optional[bytes]]:
     """
     Single MGET for a set of keys that share the same hash slot (we enforce with {part=XXXXX}).
@@ -408,7 +432,7 @@ async def mget_partition(r: Redis, keys: List[str]) -> List[Optional[bytes]]:
     # Use a plain MGET; for cluster this works because keys share slot tag.
     return await retry_with_backoff(r.mget, keys, max_retries=3)
 
-async def read_from_redis(redis_url: str, prefix: str, partitions: List[int], batches_per_part: int,
+async def read_from_redis(redis_url: str, prefix: str, partitions: List[int] | None, batches_per_part: int,
                           pipeline: int, concurrency: int, cluster: bool) -> pa.Table:
     try:
         r = await open_redis(redis_url, cluster)
@@ -417,6 +441,15 @@ async def read_from_redis(redis_url: str, prefix: str, partitions: List[int], ba
         raise
 
     try:
+        # If partitions is None, discover all partitions
+        if partitions is None:
+            logger.info(f"Discovering partitions from Redis with prefix '{prefix}'...")
+            partitions = await discover_partitions(r, prefix)
+            logger.info(f"Found {len(partitions)} partitions: {partitions}")
+            if not partitions:
+                logger.warning("No partitions found in Redis")
+                return pa.table({})
+
         # Build keys per partition (hash-tagged)
         all_chunks: List[List[str]] = []
         for p in partitions:
@@ -671,11 +704,12 @@ def build_cli():
     r = sub.add_parser("read", help="Async parallel read from Redis + parse")
     r.add_argument("--redis-url", required=True)
     r.add_argument("--prefix", required=True)
-    r.add_argument("--partitions", required=True, help="Comma-separated partition ids, e.g. 0,1,2")
+    r.add_argument("--partitions", required=True, help="Comma-separated partition ids (e.g. 0,1,2) or 'all' to read all partitions")
     r.add_argument("--batches", type=int, required=True, help="Batches per partition (to build keys)")
     r.add_argument("--pipeline", type=int, default=64, help="Keys per MGET (same hash slot)")
     r.add_argument("--concurrency", type=int, default=256, help="Concurrent MGET batches")
     r.add_argument("--cluster", choices=["on", "off"], default="off")
+    r.add_argument("--out", type=Path, help="Optional: Save reconstituted Arrow file to this path")
 
     # S3 commands
     s3_upload = sub.add_parser("s3-upload", help="Upload Arrow IPC file to S3")
@@ -698,6 +732,11 @@ def build_cli():
     local_read = sub.add_parser("local-read", help="Read Arrow IPC file from local filesystem (baseline benchmark)")
     local_read.add_argument("--inp", required=True, type=Path, help="Input Arrow IPC file")
     local_read.add_argument("--partitions", required=True, help="Comma-separated partition ids, e.g. 0,1,2")
+
+    # Verify command
+    verify = sub.add_parser("verify", help="Verify two Arrow IPC files are identical")
+    verify.add_argument("--file1", required=True, type=Path, help="First Arrow IPC file")
+    verify.add_argument("--file2", required=True, type=Path, help="Second Arrow IPC file")
 
     return p
 
@@ -737,8 +776,13 @@ async def main_async():
         print(f"   Time: {metrics['total_time']:.2f}s")
         print(f"   Throughput: {metrics['throughput_mb_per_sec']:.2f} MB/s")
     elif args.cmd == "read":
-        parts = [int(x) for x in args.partitions.split(",") if x.strip() != ""]
-        _ = await read_from_redis(
+        # Parse partitions: "all" or comma-separated list
+        if args.partitions.lower() == "all":
+            parts = None  # Will auto-discover
+        else:
+            parts = [int(x) for x in args.partitions.split(",") if x.strip() != ""]
+
+        table = await read_from_redis(
             redis_url=args.redis_url,
             prefix=args.prefix,
             partitions=parts,
@@ -747,6 +791,16 @@ async def main_async():
             concurrency=args.concurrency,
             cluster=(args.cluster == "on"),
         )
+
+        print(f"\n✅ Read {table.num_rows:,} rows from Redis")
+
+        # Optionally save reconstituted Arrow file
+        if args.out:
+            writer = ipc.new_file(str(args.out), table.schema)
+            writer.write_table(table)
+            writer.close()
+            file_size_mb = args.out.stat().st_size / (1024 * 1024)
+            print(f"   💾 Saved to {args.out} ({file_size_mb:.2f} MB)")
     elif args.cmd == "s3-upload":
         metrics = upload_to_s3(
             ipc_path=args.inp,
@@ -778,6 +832,46 @@ async def main_async():
             partitions=parts,
         )
         print(f"\n✅ Read {table.num_rows:,} rows from local file")
+    elif args.cmd == "verify":
+        # Read both files
+        reader1 = ipc.open_file(str(args.file1))
+        reader2 = ipc.open_file(str(args.file2))
+
+        table1 = reader1.read_all()
+        table2 = reader2.read_all()
+
+        print(f"\n🔍 Verifying Arrow files...")
+        print(f"   File 1: {args.file1} ({args.file1.stat().st_size / (1024*1024):.2f} MB, {table1.num_rows:,} rows)")
+        print(f"   File 2: {args.file2} ({args.file2.stat().st_size / (1024*1024):.2f} MB, {table2.num_rows:,} rows)")
+
+        # Check schema
+        if table1.schema != table2.schema:
+            print(f"\n❌ SCHEMAS DIFFER!")
+            print(f"   File 1 schema: {table1.schema}")
+            print(f"   File 2 schema: {table2.schema}")
+            return
+
+        # Check row count
+        if table1.num_rows != table2.num_rows:
+            print(f"\n❌ ROW COUNTS DIFFER!")
+            print(f"   File 1: {table1.num_rows:,} rows")
+            print(f"   File 2: {table2.num_rows:,} rows")
+            return
+
+        # Check data equality
+        if table1.equals(table2):
+            print(f"\n✅ FILES ARE IDENTICAL!")
+            print(f"   Schema: {len(table1.schema)} columns")
+            print(f"   Rows: {table1.num_rows:,}")
+        else:
+            print(f"\n❌ DATA DIFFERS!")
+            print(f"   Schemas match, row counts match, but data values differ")
+            # Try to find which column differs
+            for col_name in table1.column_names:
+                col1 = table1.column(col_name)
+                col2 = table2.column(col_name)
+                if not col1.equals(col2):
+                    print(f"   Column '{col_name}' differs")
 
 def main():
     asyncio.run(main_async())

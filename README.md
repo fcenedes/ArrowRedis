@@ -291,6 +291,7 @@ Stored 512 chunks to Redis under 'demo:v1:' (keys use hash tag {part=XXXXX}).
 
 Read selected partitions back from Redis in parallel:
 
+**Read specific partitions:**
 ```bash
 python bench_arrow.py read \
   --redis-url redis://localhost:6379/0 \
@@ -302,18 +303,32 @@ python bench_arrow.py read \
   --cluster off
 ```
 
+**Read ALL partitions and reconstitute the original file:**
+```bash
+python bench_arrow.py read \
+  --redis-url redis://localhost:6379/0 \
+  --prefix demo:v1 \
+  --partitions all \
+  --batches 16 \
+  --out ./reconstituted.arrow
+```
+
 **Parameters:**
 - `--redis-url`: Redis connection URL
 - `--prefix`: Key prefix (must match split command)
-- `--partitions`: Comma-separated partition IDs to read (e.g., `0,1,2` or `0,5,10,15`)
+- `--partitions`: Comma-separated partition IDs (e.g., `0,1,2`) or `all` to read all partitions
 - `--batches`: Batches per partition (must match generation)
 - `--pipeline`: Keys per MGET operation (default: 64)
 - `--concurrency`: Maximum concurrent MGET operations (default: 256)
 - `--cluster`: `on` for RedisCluster, `off` for standalone/proxy (default: off)
+- `--out`: Optional output file to save reconstituted Arrow file
 
 **Example output:**
 ```
 Fetched 48/48 present chunks in 0.23s; parsed in 0.15s; rows=4,800,000
+
+✅ Read 4,800,000 rows from Redis
+   💾 Saved to ./reconstituted.arrow (245.67 MB)
 ```
 
 ### 4. S3 Upload (Optional)
@@ -392,6 +407,33 @@ python bench_arrow.py local-read \
 Reading from local: 100%|████████████| 128/128 [00:00<00:00, 256.45batch/s]
 
 ✅ Read 400,000 rows from local file
+```
+
+### 7. Verify Files (Round-trip Test)
+
+Verify that a reconstituted file matches the original:
+
+```bash
+# Full round-trip test
+python bench_arrow.py gen --out ./original.arrow --partitions 8 --batches 16 --rows 100000
+python bench_arrow.py split --inp ./original.arrow --redis-url redis://localhost:6379/0 --prefix test --batches 16
+python bench_arrow.py read --redis-url redis://localhost:6379/0 --prefix test --partitions all --batches 16 --out ./reconstituted.arrow
+python bench_arrow.py verify --file1 ./original.arrow --file2 ./reconstituted.arrow
+```
+
+**Parameters:**
+- `--file1`: First Arrow IPC file
+- `--file2`: Second Arrow IPC file
+
+**Example output:**
+```
+🔍 Verifying Arrow files...
+   File 1: ./original.arrow (245.67 MB, 12,800,000 rows)
+   File 2: ./reconstituted.arrow (245.67 MB, 12,800,000 rows)
+
+✅ FILES ARE IDENTICAL!
+   Schema: 10 columns
+   Rows: 12,800,000
 ```
 
 ## Data Schema
