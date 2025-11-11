@@ -40,6 +40,9 @@ from bench_arrow import (
     split_ipc_to_redis,
     read_from_redis,
     open_redis,
+    upload_to_s3,
+    read_from_s3,
+    S3_AVAILABLE,
 )
 
 
@@ -79,13 +82,20 @@ class BenchmarkResult:
     split_chunks: int
     split_throughput_mb_sec: float
     
-    # Read metrics
+    # Read metrics (Redis)
     read_time_sec: float
     read_fetch_time_sec: float
     read_parse_time_sec: float
     read_rows: int
     read_throughput_mb_sec: float
-    
+
+    # S3 metrics (optional)
+    s3_upload_time_sec: float = 0.0
+    s3_upload_throughput_mb_sec: float = 0.0
+    s3_read_time_sec: float = 0.0
+    s3_read_throughput_mb_sec: float = 0.0
+    s3_read_rows: int = 0
+
     # Overall
     total_time_sec: float
     
@@ -121,6 +131,29 @@ class BenchmarkResult:
         print(f"  Parse time: {self.read_parse_time_sec:.2f}s")
         print(f"  Rows read: {self.read_rows:,}")
         print(f"  Throughput: {self.read_throughput_mb_sec:.2f} MB/s")
+
+        if self.s3_upload_time_sec > 0:
+            print(f"\nS3 Upload:")
+            print(f"  Time: {self.s3_upload_time_sec:.2f}s")
+            print(f"  Throughput: {self.s3_upload_throughput_mb_sec:.2f} MB/s")
+
+        if self.s3_read_time_sec > 0:
+            print(f"\nS3 Read:")
+            print(f"  Time: {self.s3_read_time_sec:.2f}s")
+            print(f"  Rows read: {self.s3_read_rows:,}")
+            print(f"  Throughput: {self.s3_read_throughput_mb_sec:.2f} MB/s")
+
+            # Comparison
+            if self.read_time_sec > 0:
+                speedup = self.s3_read_time_sec / self.read_time_sec
+                print(f"\n📊 Redis vs S3 Read Comparison:")
+                print(f"  Redis: {self.read_time_sec:.2f}s ({self.read_throughput_mb_sec:.2f} MB/s)")
+                print(f"  S3: {self.s3_read_time_sec:.2f}s ({self.s3_read_throughput_mb_sec:.2f} MB/s)")
+                if speedup > 1:
+                    print(f"  ⚡ Redis is {speedup:.2f}x FASTER than S3")
+                else:
+                    print(f"  ⚠️  S3 is {1/speedup:.2f}x faster than Redis")
+
         print(f"\nTotal Time: {self.total_time_sec:.2f}s")
         print(f"{'='*80}\n")
 
@@ -166,9 +199,14 @@ async def run_benchmark(
     max_inflight: int = 256,
     pipeline: int = 64,
     concurrency: int = 256,
+    s3_bucket: str = None,
+    s3_key_prefix: str = "arrowredis-bench",
+    aws_access_key: str = None,
+    aws_secret_key: str = None,
+    aws_region: str = "us-east-1",
 ) -> BenchmarkResult:
     """
-    Run a complete benchmark: generate -> split -> read.
+    Run a complete benchmark: generate -> split -> read (Redis + optionally S3).
     """
     print(f"\n🚀 Starting benchmark: {config.name}")
     print(f"   Target size: ~{config.target_size_mb} MB")
@@ -191,6 +229,8 @@ async def run_benchmark(
         dict_strings=config.dict_strings,
         string_card=config.string_cardinality,
         seed=42,
+        parallel=True,  # Enable parallel generation for benchmarks
+        max_workers=None,  # Use default (cpu_count)
     )
 
     gen_time = gen_metrics['total_time']
@@ -273,12 +313,66 @@ async def run_benchmark(
     
     read_time = time.perf_counter() - read_start
     read_throughput_mb = file_size_mb / read_time
-    
+
     print(f"   ✅ Read {rows_read:,} rows in {read_time:.2f}s")
     print(f"   ⚡ Throughput: {read_throughput_mb:.2f} MB/s")
-    
+
+    # 4. S3 Upload and Read (if configured)
+    s3_upload_time = 0.0
+    s3_upload_throughput = 0.0
+    s3_read_time = 0.0
+    s3_read_throughput = 0.0
+    s3_read_rows = 0
+
+    if s3_bucket and S3_AVAILABLE:
+        s3_key = f"{s3_key_prefix}/{config.name.lower()}.arrow"
+
+        # Upload to S3
+        print(f"\n☁️  Uploading to S3...")
+        s3_metrics = upload_to_s3(
+            ipc_path=arrow_file,
+            s3_bucket=s3_bucket,
+            s3_key=s3_key,
+            aws_access_key=aws_access_key,
+            aws_secret_key=aws_secret_key,
+            aws_region=aws_region,
+        )
+        s3_upload_time = s3_metrics['upload_time']
+        s3_upload_throughput = s3_metrics['throughput_mb_per_sec']
+
+        print(f"   ✅ Uploaded {file_size_mb:.2f} MB in {s3_upload_time:.2f}s")
+        print(f"   ⚡ Throughput: {s3_upload_throughput:.2f} MB/s")
+
+        # Read from S3
+        print(f"\n☁️  Reading from S3...")
+        s3_read_start = time.perf_counter()
+        s3_table = read_from_s3(
+            s3_bucket=s3_bucket,
+            s3_key=s3_key,
+            partitions=partitions_to_read,
+            aws_access_key=aws_access_key,
+            aws_secret_key=aws_secret_key,
+            aws_region=aws_region,
+        )
+        s3_read_time = time.perf_counter() - s3_read_start
+        s3_read_throughput = file_size_mb / s3_read_time if s3_read_time > 0 else 0
+        s3_read_rows = s3_table.num_rows
+
+        print(f"   ✅ Read {s3_read_rows:,} rows in {s3_read_time:.2f}s")
+        print(f"   ⚡ Throughput: {s3_read_throughput:.2f} MB/s")
+
+        # Comparison
+        speedup = s3_read_time / read_time if read_time > 0 else 0
+        print(f"\n📊 Redis vs S3 Read:")
+        print(f"   Redis: {read_time:.2f}s ({read_throughput_mb:.2f} MB/s)")
+        print(f"   S3: {s3_read_time:.2f}s ({s3_read_throughput:.2f} MB/s)")
+        if speedup > 1:
+            print(f"   ⚡ Redis is {speedup:.2f}x FASTER")
+        else:
+            print(f"   ⚠️  S3 is {1/speedup:.2f}x faster")
+
     total_time = time.perf_counter() - total_start
-    
+
     # Create result
     result = BenchmarkResult(
         config=config,
@@ -294,9 +388,14 @@ async def run_benchmark(
         read_parse_time_sec=parse_time,
         read_rows=rows_read,
         read_throughput_mb_sec=read_throughput_mb,
+        s3_upload_time_sec=s3_upload_time,
+        s3_upload_throughput_mb_sec=s3_upload_throughput,
+        s3_read_time_sec=s3_read_time,
+        s3_read_throughput_mb_sec=s3_read_throughput,
+        s3_read_rows=s3_read_rows,
         total_time_sec=total_time,
     )
-    
+
     return result
 
 
@@ -338,7 +437,19 @@ async def main_async():
                        help="Concurrent MGET operations (default: 256)")
     parser.add_argument("--output-json", type=Path, default=None,
                        help="Save results to JSON file")
-    
+
+    # S3 comparison options
+    parser.add_argument("--s3-bucket", type=str, default=None,
+                       help="S3 bucket for comparison benchmark (optional)")
+    parser.add_argument("--s3-key-prefix", type=str, default="arrowredis-bench",
+                       help="S3 key prefix (default: arrowredis-bench)")
+    parser.add_argument("--aws-access-key", type=str, default=None,
+                       help="AWS access key (optional, uses default credentials if not provided)")
+    parser.add_argument("--aws-secret-key", type=str, default=None,
+                       help="AWS secret key (optional)")
+    parser.add_argument("--aws-region", type=str, default="us-east-1",
+                       help="AWS region (default: us-east-1)")
+
     args = parser.parse_args()
     
     # Determine which benchmarks to run
@@ -353,6 +464,8 @@ async def main_async():
     print(f"Redis URL: {args.redis_url}")
     print(f"Output directory: {args.output_dir}")
     print(f"Benchmarks: {', '.join(c.name for c in configs)}")
+    if args.s3_bucket:
+        print(f"S3 Comparison: s3://{args.s3_bucket}/{args.s3_key_prefix}")
     print(f"{'='*80}\n")
     
     results: List[BenchmarkResult] = []
@@ -367,6 +480,11 @@ async def main_async():
                 max_inflight=args.max_inflight,
                 pipeline=args.pipeline,
                 concurrency=args.concurrency,
+                s3_bucket=args.s3_bucket,
+                s3_key_prefix=args.s3_key_prefix,
+                aws_access_key=args.aws_access_key,
+                aws_secret_key=args.aws_secret_key,
+                aws_region=args.aws_region,
             )
             results.append(result)
             result.print_summary()

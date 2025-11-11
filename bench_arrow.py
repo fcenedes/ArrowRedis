@@ -24,6 +24,8 @@ from __future__ import annotations
 import argparse, asyncio, io, logging, sys, time
 from pathlib import Path
 from typing import List, Dict, Optional, TypeVar, Callable
+from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import cpu_count
 
 import numpy as np
 import pyarrow as pa
@@ -48,6 +50,14 @@ try:
     from redis.asyncio.cluster import RedisCluster  # available if redis>=4.3
 except Exception:
     RedisCluster = None
+
+# ---- S3 support ----
+try:
+    import boto3
+    from pyarrow import fs as pafs
+    S3_AVAILABLE = True
+except ImportError:
+    S3_AVAILABLE = False
 
 
 # ----------------------------
@@ -130,8 +140,32 @@ def _make_batch(rows: int, partition_id: int, global_batch_id: int,
     ]
     return pa.record_batch([c for _, c in cols], names=[n for n, _ in cols])
 
+def _generate_batch_worker(args):
+    """
+    Worker function for parallel batch generation.
+    Returns serialized RecordBatch as bytes.
+    """
+    rows, partition_id, global_batch_id, dict_strings, vocab, seed_offset = args
+    rng = np.random.default_rng(seed_offset)
+    batch = _make_batch(rows, partition_id, global_batch_id, dict_strings, vocab, rng)
+
+    # Serialize to bytes for IPC transfer
+    sink = pa.BufferOutputStream()
+    writer = pa.ipc.RecordBatchStreamWriter(sink, batch.schema)
+    writer.write_batch(batch)
+    writer.close()
+    return sink.getvalue().to_pybytes()
+
 def generate_one_ipc_file(out: Path, partitions: int, batches: int, rows: int,
-                          compression: str, dict_strings: bool, string_card: int, seed: int) -> Dict[str, float]:
+                          compression: str, dict_strings: bool, string_card: int, seed: int,
+                          parallel: bool = True, max_workers: Optional[int] = None) -> Dict[str, float]:
+    """
+    Generate Arrow IPC file with optional parallel batch generation.
+
+    Args:
+        parallel: If True, use ProcessPoolExecutor for parallel batch generation
+        max_workers: Number of worker processes (default: cpu_count())
+    """
     t_start = time.perf_counter()
 
     rng = np.random.default_rng(seed)
@@ -146,20 +180,68 @@ def generate_one_ipc_file(out: Path, partitions: int, batches: int, rows: int,
                         dict_strings=dict_strings, vocab=vocab, rng=rng)
     opts = ipc.IpcWriteOptions(compression=None if compression == "uncompressed" else compression)
 
-    with pa.OSFile(str(out), "wb") as sink, \
-         ipc.RecordBatchFileWriter(sink, first.schema, options=opts) as w, \
-         tqdm(total=total_batches, desc="Generating batches", unit="batch", disable=None) as pbar:
+    # Use parallel only if beneficial (enough batches to offset process overhead)
+    # Heuristic: parallel is beneficial when total_batches >= 64 or rows >= 50000
+    use_parallel = parallel and (total_batches >= 64 or (total_batches >= 16 and rows >= 50000))
 
-        w.write_batch(first)
-        pbar.update(1)
+    if use_parallel:
+        # Parallel generation
+        if max_workers is None:
+            max_workers = min(cpu_count(), total_batches)
 
+        logger.info(f"Using parallel generation with {max_workers} workers ({total_batches} batches)")
+
+        # Prepare batch arguments
+        batch_args = []
         for p in range(partitions):
-            start_b = 0 if p != 0 else 1
-            for b in range(start_b, batches):
-                rb = _make_batch(rows, partition_id=p, global_batch_id=(p*batches+b),
-                                 dict_strings=dict_strings, vocab=vocab, rng=rng)
-                w.write_batch(rb)
+            for b in range(batches):
+                if p == 0 and b == 0:
+                    continue  # Skip first batch (already generated)
+                global_batch_id = p * batches + b
+                seed_offset = seed + global_batch_id
+                batch_args.append((rows, p, global_batch_id, dict_strings, vocab, seed_offset))
+
+        with pa.OSFile(str(out), "wb") as sink, \
+             ipc.RecordBatchFileWriter(sink, first.schema, options=opts) as w, \
+             ProcessPoolExecutor(max_workers=max_workers) as executor, \
+             tqdm(total=total_batches, desc="Generating batches", unit="batch", disable=None) as pbar:
+
+            # Write first batch
+            w.write_batch(first)
+            pbar.update(1)
+
+            # Submit all batch generation tasks
+            futures = [executor.submit(_generate_batch_worker, args) for args in batch_args]
+
+            # Write batches as they complete
+            for future in futures:
+                batch_bytes = future.result()
+                # Deserialize batch
+                reader = pa.ipc.RecordBatchStreamReader(batch_bytes)
+                batch = reader.read_next_batch()
+                w.write_batch(batch)
                 pbar.update(1)
+    else:
+        # Sequential generation (original code)
+        if parallel:
+            logger.info(f"Using sequential generation ({total_batches} batches - parallel overhead not beneficial)")
+        else:
+            logger.info("Using sequential generation")
+
+        with pa.OSFile(str(out), "wb") as sink, \
+             ipc.RecordBatchFileWriter(sink, first.schema, options=opts) as w, \
+             tqdm(total=total_batches, desc="Generating batches", unit="batch", disable=None) as pbar:
+
+            w.write_batch(first)
+            pbar.update(1)
+
+            for p in range(partitions):
+                start_b = 0 if p != 0 else 1
+                for b in range(start_b, batches):
+                    rb = _make_batch(rows, partition_id=p, global_batch_id=(p*batches+b),
+                                     dict_strings=dict_strings, vocab=vocab, rng=rng)
+                    w.write_batch(rb)
+                    pbar.update(1)
 
     t_total = time.perf_counter() - t_start
     file_size = out.stat().st_size
@@ -374,6 +456,142 @@ async def read_from_redis(redis_url: str, prefix: str, partitions: List[int], ba
         await r.close()
 
 
+# ---------------------------------
+# S3 Upload and Read
+# ---------------------------------
+def upload_to_s3(ipc_path: Path, s3_bucket: str, s3_key: str,
+                 aws_access_key: Optional[str] = None,
+                 aws_secret_key: Optional[str] = None,
+                 aws_region: Optional[str] = None) -> Dict[str, float]:
+    """
+    Upload Arrow IPC file to S3.
+
+    Args:
+        ipc_path: Local Arrow IPC file path
+        s3_bucket: S3 bucket name
+        s3_key: S3 object key (path within bucket)
+        aws_access_key: AWS access key (optional, uses default credentials if None)
+        aws_secret_key: AWS secret key (optional)
+        aws_region: AWS region (optional, defaults to us-east-1)
+
+    Returns:
+        Dictionary with metrics (file_size_mb, upload_time, throughput_mb_per_sec)
+    """
+    if not S3_AVAILABLE:
+        raise ImportError("boto3 is required for S3 support. Install with: pip install boto3")
+
+    t_start = time.perf_counter()
+
+    # Create S3 client
+    session_kwargs = {}
+    if aws_access_key and aws_secret_key:
+        session_kwargs['aws_access_key_id'] = aws_access_key
+        session_kwargs['aws_secret_access_key'] = aws_secret_key
+    if aws_region:
+        session_kwargs['region_name'] = aws_region
+
+    s3_client = boto3.client('s3', **session_kwargs)
+
+    # Get file size
+    file_size = ipc_path.stat().st_size
+    file_size_mb = file_size / (1024**2)
+
+    # Upload with progress bar
+    logger.info(f"Uploading {file_size_mb:.2f} MB to s3://{s3_bucket}/{s3_key}")
+
+    with tqdm(total=file_size, desc="Uploading to S3", unit="B", unit_scale=True, disable=None) as pbar:
+        def callback(bytes_transferred):
+            pbar.update(bytes_transferred)
+
+        s3_client.upload_file(
+            str(ipc_path),
+            s3_bucket,
+            s3_key,
+            Callback=callback
+        )
+
+    upload_time = time.perf_counter() - t_start
+    throughput_mb_per_sec = file_size_mb / upload_time if upload_time > 0 else 0
+
+    logger.info(f"Uploaded {file_size_mb:.2f} MB in {upload_time:.2f}s ({throughput_mb_per_sec:.2f} MB/s)")
+
+    return {
+        'file_size_mb': file_size_mb,
+        'upload_time': upload_time,
+        'throughput_mb_per_sec': throughput_mb_per_sec,
+    }
+
+
+def read_from_s3(s3_bucket: str, s3_key: str, partitions: List[int],
+                 aws_access_key: Optional[str] = None,
+                 aws_secret_key: Optional[str] = None,
+                 aws_region: Optional[str] = None) -> pa.Table:
+    """
+    Read Arrow IPC file from S3 using PyArrow's parallel reader.
+
+    Args:
+        s3_bucket: S3 bucket name
+        s3_key: S3 object key (path within bucket)
+        partitions: List of partition IDs to read (for filtering)
+        aws_access_key: AWS access key (optional)
+        aws_secret_key: AWS secret key (optional)
+        aws_region: AWS region (optional)
+
+    Returns:
+        PyArrow Table with selected partitions
+    """
+    if not S3_AVAILABLE:
+        raise ImportError("boto3 and pyarrow[s3] are required for S3 support")
+
+    t_start = time.perf_counter()
+
+    # Create S3 filesystem
+    fs_kwargs = {}
+    if aws_access_key and aws_secret_key:
+        fs_kwargs['access_key'] = aws_access_key
+        fs_kwargs['secret_key'] = aws_secret_key
+    if aws_region:
+        fs_kwargs['region'] = aws_region
+
+    s3_fs = pafs.S3FileSystem(**fs_kwargs)
+
+    # Read Arrow file from S3
+    s3_path = f"{s3_bucket}/{s3_key}"
+    logger.info(f"Reading from s3://{s3_path}")
+
+    t_fetch_start = time.perf_counter()
+    with s3_fs.open_input_file(s3_path) as f:
+        reader = ipc.open_file(f)
+
+        # Read all batches (PyArrow handles parallelism internally)
+        batches = []
+        with tqdm(total=reader.num_record_batches, desc="Reading from S3", unit="batch", disable=None) as pbar:
+            for i in range(reader.num_record_batches):
+                batch = reader.get_batch(i)
+
+                # Filter by partition if needed
+                if partitions:
+                    p_idx = batch.schema.get_field_index("partition")
+                    if p_idx != -1:
+                        part_id = int(batch.column(p_idx)[0].as_py())
+                        if part_id not in partitions:
+                            pbar.update(1)
+                            continue
+
+                batches.append(batch)
+                pbar.update(1)
+
+    t_fetch = time.perf_counter() - t_fetch_start
+
+    # Combine batches
+    table = pa.Table.from_batches(batches) if batches else pa.table({})
+
+    total_time = time.perf_counter() - t_start
+    logger.info(f"Read {table.num_rows:,} rows from S3 in {total_time:.2f}s (fetch: {t_fetch:.2f}s)")
+
+    return table
+
+
 # ----------------------------
 # CLI
 # ----------------------------
@@ -390,6 +608,9 @@ def build_cli():
     g.add_argument("--dict-strings", action="store_true")
     g.add_argument("--string-cardinality", type=int, default=5000)
     g.add_argument("--seed", type=int, default=123)
+    g.add_argument("--parallel", action="store_true", default=True, help="Use parallel batch generation (default: True)")
+    g.add_argument("--no-parallel", dest="parallel", action="store_false", help="Disable parallel generation")
+    g.add_argument("--workers", type=int, default=None, help="Number of worker processes (default: cpu_count)")
 
     s = sub.add_parser("split", help="Split ONE IPC file into Redis (partition×batch IPC streams)")
     s.add_argument("--inp", required=True, type=Path)
@@ -409,6 +630,23 @@ def build_cli():
     r.add_argument("--concurrency", type=int, default=256, help="Concurrent MGET batches")
     r.add_argument("--cluster", choices=["on", "off"], default="off")
 
+    # S3 commands
+    s3_upload = sub.add_parser("s3-upload", help="Upload Arrow IPC file to S3")
+    s3_upload.add_argument("--inp", required=True, type=Path, help="Input Arrow IPC file")
+    s3_upload.add_argument("--bucket", required=True, help="S3 bucket name")
+    s3_upload.add_argument("--key", required=True, help="S3 object key (path within bucket)")
+    s3_upload.add_argument("--aws-access-key", help="AWS access key (optional, uses default credentials if not provided)")
+    s3_upload.add_argument("--aws-secret-key", help="AWS secret key (optional)")
+    s3_upload.add_argument("--aws-region", default="us-east-1", help="AWS region (default: us-east-1)")
+
+    s3_read = sub.add_parser("s3-read", help="Read Arrow IPC file from S3")
+    s3_read.add_argument("--bucket", required=True, help="S3 bucket name")
+    s3_read.add_argument("--key", required=True, help="S3 object key (path within bucket)")
+    s3_read.add_argument("--partitions", required=True, help="Comma-separated partition ids, e.g. 0,1,2")
+    s3_read.add_argument("--aws-access-key", help="AWS access key (optional)")
+    s3_read.add_argument("--aws-secret-key", help="AWS secret key (optional)")
+    s3_read.add_argument("--aws-region", default="us-east-1", help="AWS region (default: us-east-1)")
+
     return p
 
 async def main_async():
@@ -423,6 +661,8 @@ async def main_async():
             dict_strings=args.dict_strings,
             string_card=args.string_cardinality,
             seed=args.seed,
+            parallel=args.parallel,
+            max_workers=args.workers,
         )
         print(f"\n✅ Wrote {args.out}")
         print(f"   Partitions: {args.partitions} × Batches: {args.batches} × Rows: {args.rows:,}")
@@ -455,6 +695,30 @@ async def main_async():
             concurrency=args.concurrency,
             cluster=(args.cluster == "on"),
         )
+    elif args.cmd == "s3-upload":
+        metrics = upload_to_s3(
+            ipc_path=args.inp,
+            s3_bucket=args.bucket,
+            s3_key=args.key,
+            aws_access_key=args.aws_access_key,
+            aws_secret_key=args.aws_secret_key,
+            aws_region=args.aws_region,
+        )
+        print(f"\n✅ Uploaded to s3://{args.bucket}/{args.key}")
+        print(f"   File size: {metrics['file_size_mb']:.2f} MB")
+        print(f"   Time: {metrics['upload_time']:.2f}s")
+        print(f"   Throughput: {metrics['throughput_mb_per_sec']:.2f} MB/s")
+    elif args.cmd == "s3-read":
+        parts = [int(x) for x in args.partitions.split(",") if x.strip() != ""]
+        table = read_from_s3(
+            s3_bucket=args.bucket,
+            s3_key=args.key,
+            partitions=parts,
+            aws_access_key=args.aws_access_key,
+            aws_secret_key=args.aws_secret_key,
+            aws_region=args.aws_region,
+        )
+        print(f"\n✅ Read {table.num_rows:,} rows from S3")
 
 def main():
     asyncio.run(main_async())
