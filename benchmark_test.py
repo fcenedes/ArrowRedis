@@ -42,6 +42,7 @@ from bench_arrow import (
     open_redis,
     upload_to_s3,
     read_from_s3,
+    read_from_local,
     S3_AVAILABLE,
 )
 
@@ -89,6 +90,11 @@ class BenchmarkResult:
     read_rows: int
     read_throughput_mb_sec: float
 
+    # Local filesystem metrics (optional)
+    local_read_time_sec: float = 0.0
+    local_read_throughput_mb_sec: float = 0.0
+    local_read_rows: int = 0
+
     # S3 metrics (optional)
     s3_upload_time_sec: float = 0.0
     s3_upload_throughput_mb_sec: float = 0.0
@@ -132,27 +138,48 @@ class BenchmarkResult:
         print(f"  Rows read: {self.read_rows:,}")
         print(f"  Throughput: {self.read_throughput_mb_sec:.2f} MB/s")
 
+        if self.local_read_time_sec > 0:
+            print(f"\n💾 Local Filesystem Read:")
+            print(f"  Time: {self.local_read_time_sec:.2f}s")
+            print(f"  Rows read: {self.local_read_rows:,}")
+            print(f"  Throughput: {self.local_read_throughput_mb_sec:.2f} MB/s")
+
         if self.s3_upload_time_sec > 0:
-            print(f"\nS3 Upload:")
+            print(f"\n☁️  S3 Upload:")
             print(f"  Time: {self.s3_upload_time_sec:.2f}s")
             print(f"  Throughput: {self.s3_upload_throughput_mb_sec:.2f} MB/s")
 
         if self.s3_read_time_sec > 0:
-            print(f"\nS3 Read:")
+            print(f"\n☁️  S3 Read:")
             print(f"  Time: {self.s3_read_time_sec:.2f}s")
             print(f"  Rows read: {self.s3_read_rows:,}")
             print(f"  Throughput: {self.s3_read_throughput_mb_sec:.2f} MB/s")
 
-            # Comparison
-            if self.read_time_sec > 0:
-                speedup = self.s3_read_time_sec / self.read_time_sec
-                print(f"\n📊 Redis vs S3 Read Comparison:")
-                print(f"  Redis: {self.read_time_sec:.2f}s ({self.read_throughput_mb_sec:.2f} MB/s)")
-                print(f"  S3: {self.s3_read_time_sec:.2f}s ({self.s3_read_throughput_mb_sec:.2f} MB/s)")
-                if speedup > 1:
-                    print(f"  ⚡ Redis is {speedup:.2f}x FASTER than S3")
-                else:
-                    print(f"  ⚠️  S3 is {1/speedup:.2f}x faster than Redis")
+        # 3-way comparison if all metrics available
+        if self.local_read_time_sec > 0 and self.read_time_sec > 0 and self.s3_read_time_sec > 0:
+            print(f"\n📊 3-Way Read Comparison:")
+            print(f"  Local FS: {self.local_read_time_sec:.2f}s ({self.local_read_throughput_mb_sec:.2f} MB/s)")
+            print(f"  Redis:    {self.read_time_sec:.2f}s ({self.read_throughput_mb_sec:.2f} MB/s)")
+            print(f"  S3:       {self.s3_read_time_sec:.2f}s ({self.s3_read_throughput_mb_sec:.2f} MB/s)")
+
+            redis_vs_local = self.local_read_time_sec / self.read_time_sec if self.read_time_sec > 0 else 0
+            redis_vs_s3 = self.s3_read_time_sec / self.read_time_sec if self.read_time_sec > 0 else 0
+
+            if redis_vs_local < 1:
+                print(f"  ⚡ Redis is {1/redis_vs_local:.2f}x FASTER than Local FS")
+            else:
+                print(f"  💾 Local FS is {redis_vs_local:.2f}x faster than Redis (expected - no network)")
+            print(f"  ⚡ Redis is {redis_vs_s3:.2f}x FASTER than S3")
+        elif self.read_time_sec > 0 and self.s3_read_time_sec > 0:
+            # 2-way comparison (Redis vs S3)
+            speedup = self.s3_read_time_sec / self.read_time_sec
+            print(f"\n📊 Redis vs S3 Read Comparison:")
+            print(f"  Redis: {self.read_time_sec:.2f}s ({self.read_throughput_mb_sec:.2f} MB/s)")
+            print(f"  S3: {self.s3_read_time_sec:.2f}s ({self.s3_read_throughput_mb_sec:.2f} MB/s)")
+            if speedup > 1:
+                print(f"  ⚡ Redis is {speedup:.2f}x FASTER than S3")
+            else:
+                print(f"  ⚠️  S3 is {1/speedup:.2f}x faster than Redis")
 
         print(f"\nTotal Time: {self.total_time_sec:.2f}s")
         print(f"{'='*80}\n")
@@ -317,7 +344,25 @@ async def run_benchmark(
     print(f"   ✅ Read {rows_read:,} rows in {read_time:.2f}s")
     print(f"   ⚡ Throughput: {read_throughput_mb:.2f} MB/s")
 
-    # 4. S3 Upload and Read (if configured)
+    # 4. Local Filesystem Read (baseline)
+    local_read_time = 0.0
+    local_read_throughput = 0.0
+    local_read_rows = 0
+
+    print(f"\n💾 Reading from local filesystem (baseline)...")
+    local_read_start = time.perf_counter()
+    local_table = read_from_local(
+        ipc_path=arrow_file,
+        partitions=partitions_to_read,
+    )
+    local_read_time = time.perf_counter() - local_read_start
+    local_read_throughput = file_size_mb / local_read_time if local_read_time > 0 else 0
+    local_read_rows = local_table.num_rows
+
+    print(f"   ✅ Read {local_read_rows:,} rows in {local_read_time:.2f}s")
+    print(f"   ⚡ Throughput: {local_read_throughput:.2f} MB/s")
+
+    # 5. S3 Upload and Read (if configured)
     s3_upload_time = 0.0
     s3_upload_throughput = 0.0
     s3_read_time = 0.0
@@ -388,6 +433,9 @@ async def run_benchmark(
         read_parse_time_sec=parse_time,
         read_rows=rows_read,
         read_throughput_mb_sec=read_throughput_mb,
+        local_read_time_sec=local_read_time,
+        local_read_throughput_mb_sec=local_read_throughput,
+        local_read_rows=local_read_rows,
         s3_upload_time_sec=s3_upload_time,
         s3_upload_throughput_mb_sec=s3_upload_throughput,
         s3_read_time_sec=s3_read_time,

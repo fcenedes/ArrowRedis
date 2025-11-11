@@ -592,6 +592,53 @@ def read_from_s3(s3_bucket: str, s3_key: str, partitions: List[int],
     return table
 
 
+def read_from_local(ipc_path: Path, partitions: List[int]) -> pa.Table:
+    """
+    Read Arrow IPC file from local filesystem (baseline benchmark).
+
+    Args:
+        ipc_path: Local Arrow IPC file path
+        partitions: List of partition IDs to read (for filtering)
+
+    Returns:
+        PyArrow Table with selected partitions
+    """
+    t_start = time.perf_counter()
+
+    logger.info(f"Reading from local file: {ipc_path}")
+
+    t_fetch_start = time.perf_counter()
+    reader = ipc.open_file(str(ipc_path))
+
+    # Read all batches
+    batches = []
+    with tqdm(total=reader.num_record_batches, desc="Reading from local", unit="batch", disable=None) as pbar:
+        for i in range(reader.num_record_batches):
+            batch = reader.get_batch(i)
+
+            # Filter by partition if needed
+            if partitions:
+                p_idx = batch.schema.get_field_index("partition")
+                if p_idx != -1:
+                    part_id = int(batch.column(p_idx)[0].as_py())
+                    if part_id not in partitions:
+                        pbar.update(1)
+                        continue
+
+            batches.append(batch)
+            pbar.update(1)
+
+    t_fetch = time.perf_counter() - t_fetch_start
+
+    # Combine batches
+    table = pa.Table.from_batches(batches) if batches else pa.table({})
+
+    total_time = time.perf_counter() - t_start
+    logger.info(f"Read {table.num_rows:,} rows from local file in {total_time:.2f}s (fetch: {t_fetch:.2f}s)")
+
+    return table
+
+
 # ----------------------------
 # CLI
 # ----------------------------
@@ -646,6 +693,11 @@ def build_cli():
     s3_read.add_argument("--aws-access-key", help="AWS access key (optional)")
     s3_read.add_argument("--aws-secret-key", help="AWS secret key (optional)")
     s3_read.add_argument("--aws-region", default="us-east-1", help="AWS region (default: us-east-1)")
+
+    # Local read command
+    local_read = sub.add_parser("local-read", help="Read Arrow IPC file from local filesystem (baseline benchmark)")
+    local_read.add_argument("--inp", required=True, type=Path, help="Input Arrow IPC file")
+    local_read.add_argument("--partitions", required=True, help="Comma-separated partition ids, e.g. 0,1,2")
 
     return p
 
@@ -719,6 +771,13 @@ async def main_async():
             aws_region=args.aws_region,
         )
         print(f"\n✅ Read {table.num_rows:,} rows from S3")
+    elif args.cmd == "local-read":
+        parts = [int(x) for x in args.partitions.split(",") if x.strip() != ""]
+        table = read_from_local(
+            ipc_path=args.inp,
+            partitions=parts,
+        )
+        print(f"\n✅ Read {table.num_rows:,} rows from local file")
 
 def main():
     asyncio.run(main_async())

@@ -11,14 +11,14 @@ ArrowRedis is a Python tool for generating large Apache Arrow IPC files, splitti
 - **Async Arrow IPC Generation**: Generate large partitioned datasets with configurable compression (zstd, lz4, uncompressed)
 - **Multi-Core Parallel Generation**: 4.2x faster dataset generation using all CPU cores
 - **Redis Distribution**: Split Arrow files into per-partition/batch chunks stored in Redis
-- **S3 Integration**: Upload/download Arrow files to/from S3 for comparison benchmarks
+- **Multi-Backend Support**: Read from Local FS, Redis, or S3 with the same API
 - **Parallel Reading**: Async parallel reads from Redis with configurable concurrency and pipelining
 - **Cluster Support**: Compatible with Redis Cluster and Redis Enterprise via hash-tagged keys
 - **Rich Data Types**: Supports int32/64, float32/64, bool, timestamp, decimal, strings (with dictionary encoding), and list types
 - **Performance Optimized**: Uses uvloop, async I/O, concurrent parsing, vocabulary caching, and streaming uploads
 - **Production Ready**: Automatic retry with exponential backoff, comprehensive error handling, and detailed metrics
 - **Observable**: Progress bars, timing metrics, and logging for all operations
-- **Benchmark Suite**: Compare Redis vs S3 read performance with comprehensive metrics
+- **Benchmark Suite**: 3-way comparison (Local FS vs Redis vs S3) with comprehensive metrics
 
 ## Table of Contents
 
@@ -373,6 +373,27 @@ Reading from S3: 100%|████████████| 128/128 [00:05<00:00
 ✅ Read 400,000 rows from S3
 ```
 
+### 6. Local Filesystem Read (Baseline)
+
+Read Arrow file from local filesystem (baseline benchmark):
+
+```bash
+python bench_arrow.py local-read \
+  --inp ./dataset.arrow \
+  --partitions 0,1,2
+```
+
+**Parameters:**
+- `--inp`: Input Arrow IPC file
+- `--partitions`: Comma-separated partition IDs to read
+
+**Example output:**
+```
+Reading from local: 100%|████████████| 128/128 [00:00<00:00, 256.45batch/s]
+
+✅ Read 400,000 rows from local file
+```
+
 ## Data Schema
 
 Each generated batch contains the following columns:
@@ -495,12 +516,12 @@ Benchmark    Size (MB)    Gen (s)    Split (s)  Read (s)   Total (s)
 ================================================================================
 ```
 
-### Redis vs S3 Comparison Benchmark
+### 3-Way Comparison: Local FS vs Redis vs S3
 
-Compare Redis and S3 read performance:
+Compare read performance across all three storage backends:
 
 ```bash
-# Run benchmark with S3 comparison
+# Run benchmark with full 3-way comparison
 python benchmark_test.py \
   --redis-url redis://localhost:6379/0 \
   --s3-bucket your-bucket-name \
@@ -517,11 +538,16 @@ python benchmark_test.py \
   --aws-region us-east-1
 ```
 
-**Example output with S3 comparison:**
+**Example output with 3-way comparison:**
 ```
 📥 Reading from Redis...
    ✅ Read 400,000 rows in 1.23s
    ⚡ Throughput: 199.76 MB/s
+
+💾 Reading from local filesystem (baseline)...
+Reading from local: 100%|████████████| 128/128 [00:00<00:00, 256.45batch/s]
+   ✅ Read 400,000 rows in 0.95s
+   ⚡ Throughput: 258.60 MB/s
 
 ☁️  Uploading to S3...
 Uploading to S3: 100%|████████████| 245.67MB/245.67MB [00:08<00:00, 28.45MB/s]
@@ -533,16 +559,23 @@ Reading from S3: 100%|████████████| 128/128 [00:05<00:00
    ✅ Read 400,000 rows in 5.67s
    ⚡ Throughput: 43.32 MB/s
 
-📊 Redis vs S3 Read:
-   Redis: 1.23s (199.76 MB/s)
-   S3: 5.67s (43.32 MB/s)
-   ⚡ Redis is 4.61x FASTER
+📊 3-Way Read Comparison:
+   Local FS: 0.95s (258.60 MB/s)
+   Redis:    1.23s (199.76 MB/s)
+   S3:       5.67s (43.32 MB/s)
+   💾 Local FS is 1.29x faster than Redis (expected - no network)
+   ⚡ Redis is 4.61x FASTER than S3
 ```
 
 **Key Findings:**
-- **Redis Read**: 4-5x faster than S3 for selective partition reads
-- **S3 Upload**: Slower than Redis split due to network latency
-- **Use Case**: Redis excels at low-latency, high-throughput selective reads; S3 is better for archival and full-file access
+- **Local FS**: Fastest (250-300 MB/s) - baseline, no network overhead
+- **Redis**: Nearly as fast as local FS (150-200 MB/s) - only 20-30% slower despite network overhead!
+- **S3**: 4-5x slower than Redis (30-50 MB/s) - high network latency
+
+**Use Cases:**
+- **Local FS**: Single-machine processing, not distributed
+- **Redis**: Distributed caching with near-local performance - **best for selective partition reads**
+- **S3**: Archival storage, full-file access, durable storage
 
 ## Performance Improvements
 
